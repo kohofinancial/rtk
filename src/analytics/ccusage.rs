@@ -95,7 +95,9 @@ fn build_command() -> Option<Command> {
     }
 
     // Fallback: try npx
+    eprintln!("[info] ccusage not installed globally, fetching via npx...");
     let npx_check = resolved_command("npx")
+        .arg("--yes")
         .arg("ccusage")
         .arg("--help")
         .stdout(std::process::Stdio::null())
@@ -104,17 +106,12 @@ fn build_command() -> Option<Command> {
 
     if npx_check.map(|s| s.success()).unwrap_or(false) {
         let mut cmd = resolved_command("npx");
+        cmd.arg("--yes");
         cmd.arg("ccusage");
         return Some(cmd);
     }
 
     None
-}
-
-/// Check if ccusage CLI is available (binary or via npx)
-#[allow(dead_code)]
-pub fn is_available() -> bool {
-    build_command().is_some()
 }
 
 /// Fetch usage data from ccusage for the last 90 days
@@ -327,12 +324,5 @@ mod tests {
         let periods = result.unwrap();
         assert_eq!(periods[0].metrics.cache_creation_tokens, 0); // default
         assert_eq!(periods[0].metrics.cache_read_tokens, 0);
-    }
-
-    #[test]
-    fn test_is_available() {
-        // Just smoke test - actual availability depends on system
-        let _available = is_available();
-        // No assertion - just ensure it doesn't panic
     }
 }

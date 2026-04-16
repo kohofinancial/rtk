@@ -1,8 +1,9 @@
 //! Filters cargo output — build errors, test results, clippy warnings.
 
-use crate::core::tracking;
+use crate::core::runner;
 use crate::core::utils::{resolved_command, truncate};
-use anyhow::{Context, Result};
+use anyhow::Result;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::OnceLock;
@@ -17,7 +18,7 @@ pub enum CargoCommand {
     Nextest,
 }
 
-pub fn run(cmd: CargoCommand, args: &[String], verbose: u8) -> Result<()> {
+pub fn run(cmd: CargoCommand, args: &[String], verbose: u8) -> Result<i32> {
     match cmd {
         CargoCommand::Build => run_build(args, verbose),
         CargoCommand::Test => run_test(args, verbose),
@@ -67,13 +68,17 @@ fn restore_double_dash_with_raw(args: &[String], raw_args: &[String]) -> Vec<Str
     result
 }
 
-/// Generic cargo command runner with filtering
-fn run_cargo_filtered<F>(subcommand: &str, args: &[String], verbose: u8, filter_fn: F) -> Result<()>
+/// Generic cargo command runner with filtering.
+/// Builds the Command with restored `--` separator, then delegates to shared runner.
+fn run_cargo_filtered<F>(
+    subcommand: &str,
+    args: &[String],
+    verbose: u8,
+    filter_fn: F,
+) -> Result<i32>
 where
     F: Fn(&str) -> String,
 {
-    let timer = tracking::TimedExecution::start();
-
     let mut cmd = resolved_command("cargo");
     cmd.arg(subcommand);
 
@@ -86,62 +91,36 @@ where
         eprintln!("Running: cargo {} {}", subcommand, restored_args.join(" "));
     }
 
-    let output = cmd
-        .output()
-        .with_context(|| format!("Failed to run cargo {}", subcommand))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let raw = format!("{}\n{}", stdout, stderr);
-
-    let exit_code = output
-        .status
-        .code()
-        .unwrap_or(if output.status.success() { 0 } else { 1 });
-    let filtered = filter_fn(&raw);
-
-    if let Some(hint) =
-        crate::core::tee::tee_and_hint(&raw, &format!("cargo_{}", subcommand), exit_code)
-    {
-        println!("{}\n{}", filtered, hint);
-    } else {
-        println!("{}", filtered);
-    }
-
-    timer.track(
-        &format!("cargo {} {}", subcommand, restored_args.join(" ")),
-        &format!("rtk cargo {} {}", subcommand, restored_args.join(" ")),
-        &raw,
-        &filtered,
-    );
-
-    if !output.status.success() {
-        std::process::exit(exit_code);
-    }
-
-    Ok(())
+    runner::run_filtered(
+        cmd,
+        &format!("cargo {}", subcommand),
+        &restored_args.join(" "),
+        filter_fn,
+        runner::RunOptions::with_tee(&format!("cargo_{}", subcommand)),
+    )
 }
 
-fn run_build(args: &[String], verbose: u8) -> Result<()> {
+fn run_build(args: &[String], verbose: u8) -> Result<i32> {
     run_cargo_filtered("build", args, verbose, filter_cargo_build)
 }
 
-fn run_test(args: &[String], verbose: u8) -> Result<()> {
+fn run_test(args: &[String], verbose: u8) -> Result<i32> {
     run_cargo_filtered("test", args, verbose, filter_cargo_test)
 }
 
-fn run_clippy(args: &[String], verbose: u8) -> Result<()> {
+fn run_clippy(args: &[String], verbose: u8) -> Result<i32> {
     run_cargo_filtered("clippy", args, verbose, filter_cargo_clippy)
 }
 
-fn run_check(args: &[String], verbose: u8) -> Result<()> {
+fn run_check(args: &[String], verbose: u8) -> Result<i32> {
     run_cargo_filtered("check", args, verbose, filter_cargo_build)
 }
 
-fn run_install(args: &[String], verbose: u8) -> Result<()> {
+fn run_install(args: &[String], verbose: u8) -> Result<i32> {
     run_cargo_filtered("install", args, verbose, filter_cargo_install)
 }
 
-fn run_nextest(args: &[String], verbose: u8) -> Result<()> {
+fn run_nextest(args: &[String], verbose: u8) -> Result<i32> {
     run_cargo_filtered("nextest", args, verbose, filter_cargo_nextest)
 }
 
@@ -483,12 +462,10 @@ fn filter_cargo_nextest(output: &str) -> String {
             .and_then(|m| m.as_str().parse().ok())
             .unwrap_or(0);
 
-        let binary_text = if binaries == 1 {
-            "1 binary".to_string()
-        } else if binaries > 1 {
-            format!("{} binaries", binaries)
-        } else {
-            String::new()
+        let binary_text = match binaries.cmp(&1) {
+            Ordering::Greater => format!("{} binaries", binaries),
+            Ordering::Equal => "1 binary".to_string(),
+            Ordering::Less => String::new(),
         };
 
         if failed == 0 {
@@ -884,50 +861,62 @@ fn filter_cargo_test(output: &str) -> String {
     result.trim().to_string()
 }
 
-/// Filter cargo clippy output - group warnings by lint rule
+/// Filter cargo clippy output - show full error blocks, group warnings by lint rule
 fn filter_cargo_clippy(output: &str) -> String {
     let mut by_rule: HashMap<String, Vec<String>> = HashMap::new();
     let mut error_count = 0;
     let mut warning_count = 0;
-    let mut error_details: Vec<String> = Vec::new();
+    // Each entry is a full multi-line error block (headline + location + code context)
+    let mut error_blocks: Vec<Vec<String>> = Vec::new();
 
-    // Parse clippy output lines
-    // Format: "warning: description\n  --> file:line:col\n  |\n  | code\n"
     let mut current_rule = String::new();
+    let mut in_error = false;
+    let mut current_block: Vec<String> = Vec::new();
 
     for line in output.lines() {
-        // Skip compilation lines
+        // Skip compilation progress lines
         if line.trim_start().starts_with("Compiling")
             || line.trim_start().starts_with("Checking")
             || line.trim_start().starts_with("Downloading")
             || line.trim_start().starts_with("Downloaded")
             || line.trim_start().starts_with("Finished")
         {
+            if in_error && !current_block.is_empty() {
+                error_blocks.push(current_block.clone());
+                current_block.clear();
+                in_error = false;
+            }
             continue;
         }
 
-        // "warning: unused variable [unused_variables]" or "warning: description [clippy::rule_name]"
-        if (line.starts_with("warning:") || line.starts_with("warning["))
-            || (line.starts_with("error:") || line.starts_with("error["))
+        // Skip noise: summary counts and abort lines
+        if (line.contains("generated") && line.contains("warning"))
+            || line.contains("aborting due to")
+            || line.contains("could not compile")
         {
-            // Skip summary lines: "warning: `rtk` (bin) generated 5 warnings"
-            if line.contains("generated") && line.contains("warning") {
-                continue;
-            }
-            // Skip "error: aborting" / "error: could not compile"
-            if line.contains("aborting due to") || line.contains("could not compile") {
-                continue;
-            }
+            continue;
+        }
 
-            let is_error = line.starts_with("error");
-            if is_error {
+        let is_error_line = line.starts_with("error:") || line.starts_with("error[");
+        let is_warning_line = line.starts_with("warning:") || line.starts_with("warning[");
+
+        if is_error_line || is_warning_line {
+            // Flush any in-progress error block before starting a new diagnostic
+            if in_error && !current_block.is_empty() {
+                error_blocks.push(current_block.clone());
+                current_block.clear();
+            }
+            in_error = false;
+
+            if is_error_line {
                 error_count += 1;
-                error_details.push(truncate(line.trim(), 160));
+                in_error = true;
+                current_block.push(line.to_string());
             } else {
                 warning_count += 1;
             }
 
-            // Extract rule name from brackets
+            // Extract rule/error-code from brackets for warning grouping
             current_rule = if let Some(bracket_start) = line.rfind('[') {
                 if let Some(bracket_end) = line.rfind(']') {
                     line[bracket_start + 1..bracket_end].to_string()
@@ -935,8 +924,7 @@ fn filter_cargo_clippy(output: &str) -> String {
                     line.to_string()
                 }
             } else {
-                // No bracket: use the message itself as the rule
-                let prefix = if is_error { "error: " } else { "warning: " };
+                let prefix = if is_error_line { "error: " } else { "warning: " };
                 line.strip_prefix(prefix).unwrap_or(line).to_string()
             };
         } else if line.trim_start().starts_with("--> ") {
@@ -947,7 +935,27 @@ fn filter_cargo_clippy(output: &str) -> String {
                     .or_default()
                     .push(location);
             }
+            if in_error {
+                current_block.push(line.to_string());
+            }
+        } else if in_error {
+            if line.trim().is_empty() {
+                // Blank line terminates the error block
+                if !current_block.is_empty() {
+                    error_blocks.push(current_block.clone());
+                    current_block.clear();
+                }
+                in_error = false;
+            } else if current_block.len() < 15 {
+                // Collect code-context lines (|, ^, = note:, help:, etc.)
+                current_block.push(line.to_string());
+            }
         }
+    }
+
+    // Flush final error block
+    if in_error && !current_block.is_empty() {
+        error_blocks.push(current_block);
     }
 
     if error_count == 0 && warning_count == 0 {
@@ -961,18 +969,21 @@ fn filter_cargo_clippy(output: &str) -> String {
     ));
     result.push_str("═══════════════════════════════════════\n");
 
-    if !error_details.is_empty() {
-        result.push_str("\nError details:\n");
-        for (idx, detail) in error_details.iter().take(5).enumerate() {
-            result.push_str(&format!("  {}. {}\n", idx + 1, detail));
+    // Show full error blocks so developers can see what needs fixing
+    if !error_blocks.is_empty() {
+        result.push_str("\nErrors:\n");
+        for block in error_blocks.iter().take(10) {
+            for block_line in block {
+                result.push_str(&format!("  {}\n", truncate(block_line, 160)));
+            }
+            result.push('\n');
         }
-        if error_details.len() > 5 {
-            result.push_str(&format!("  ... +{} more errors\n", error_details.len() - 5));
+        if error_blocks.len() > 10 {
+            result.push_str(&format!("  ... +{} more errors\n", error_blocks.len() - 10));
         }
-        result.push('\n');
     }
 
-    // Sort rules by frequency
+    // Sort warning rules by frequency
     let mut rule_counts: Vec<_> = by_rule.iter().collect();
     rule_counts.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
@@ -993,28 +1004,8 @@ fn filter_cargo_clippy(output: &str) -> String {
     result.trim().to_string()
 }
 
-/// Runs an unsupported cargo subcommand by passing it through directly
-pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<()> {
-    let timer = tracking::TimedExecution::start();
-
-    if verbose > 0 {
-        eprintln!("cargo passthrough: {:?}", args);
-    }
-    let status = resolved_command("cargo")
-        .args(args)
-        .status()
-        .context("Failed to run cargo")?;
-
-    let args_str = tracking::args_display(args);
-    timer.track_passthrough(
-        &format!("cargo {}", args_str),
-        &format!("rtk cargo {} (passthrough)", args_str),
-    );
-
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
+pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
+    crate::core::runner::run_passthrough("cargo", args, verbose)
 }
 
 #[cfg(test)]
@@ -1413,8 +1404,45 @@ warning: unused variable: `x` [unused_variables]
 "#;
         let result = filter_cargo_clippy(output);
         assert!(result.contains("cargo clippy: 1 errors, 1 warnings"));
-        assert!(result.contains("Error details:"));
+        assert!(result.contains("Errors:"));
         assert!(result.contains("struct literals are not allowed here"));
+    }
+
+    #[test]
+    fn test_filter_cargo_clippy_shows_full_error_block() {
+        // Full multi-line error block must be shown so the developer can debug
+        let output = r#"    Checking rtk v0.5.0
+error[E0308]: mismatched types
+ --> src/main.rs:10:5
+  |
+9 |     fn foo() -> i32 {
+  |                 --- expected `i32` because of return type
+10|     "hello"
+  |     ^^^^^^^ expected `i32`, found `&str`
+
+error: aborting due to 1 previous error
+"#;
+        let result = filter_cargo_clippy(output);
+        assert!(result.contains("cargo clippy: 1 errors, 0 warnings"), "got: {}", result);
+        assert!(result.contains("error[E0308]: mismatched types"), "got: {}", result);
+        assert!(result.contains("src/main.rs:10:5"), "got: {}", result);
+        assert!(result.contains("expected `i32`, found `&str`"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_filter_cargo_clippy_multiple_errors_show_all_blocks() {
+        let output = r#"error[E0308]: mismatched types
+ --> src/foo.rs:5:3
+
+error[E0425]: cannot find value `x`
+ --> src/bar.rs:12:9
+
+error: aborting due to 2 previous errors
+"#;
+        let result = filter_cargo_clippy(output);
+        assert!(result.contains("2 errors"), "got: {}", result);
+        assert!(result.contains("src/foo.rs:5:3"), "got: {}", result);
+        assert!(result.contains("src/bar.rs:12:9"), "got: {}", result);
     }
 
     #[test]
