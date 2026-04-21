@@ -171,15 +171,16 @@ rtk gh run list                 # Workflow run status
 
 ### Test Runners
 ```bash
-rtk test cargo test             # Show failures only (-90%)
-rtk err npm run build           # Errors/warnings only
-rtk vitest run                  # Vitest compact (failures only)
+rtk jest                        # Jest compact (failures only)
+rtk vitest                      # Vitest compact (failures only)
 rtk playwright test             # E2E results (failures only)
 rtk pytest                      # Python tests (-90%)
 rtk go test                     # Go tests (NDJSON, -90%)
 rtk cargo test                  # Cargo tests (-90%)
 rtk rake test                   # Ruby minitest (-90%)
 rtk rspec                       # RSpec tests (JSON, -60%+)
+rtk err <cmd>                   # Filter errors only from any command
+rtk test <cmd>                  # Generic test wrapper - failures only (-90%)
 ```
 
 ### Build & Lint
@@ -234,7 +235,7 @@ rtk json config.json            # Structure without values
 rtk deps                        # Dependencies summary
 rtk env -f AWS                  # Filtered env vars
 rtk log app.log                 # Deduplicated logs
-rtk curl <url>                  # Auto-detect JSON + schema
+rtk curl <url>                  # Truncate + save full output
 rtk wget <url>                  # Download, strip progress bars
 rtk summary <long command>      # Heuristic summary
 rtk proxy <command>             # Raw passthrough + tracking
@@ -462,6 +463,15 @@ export RTK_TELEMETRY_DISABLED=1   # Blocks telemetry regardless of consent
     <img alt="StarMapper" src="https://starmapper.bruniaux.com/api/map-image/rtk-ai/rtk" />
   </picture>
 </a>
+
+## Core team
+
+- **Patrick Szymkowiak** — Founder
+  [GitHub](https://github.com/pszymkowiak) · [LinkedIn](https://www.linkedin.com/in/patrick-szymkowiak/)
+- **Florian Bruniaux** — Core contributor
+  [GitHub](https://github.com/FlorianBruniaux) · [LinkedIn](https://www.linkedin.com/in/florian-bruniaux-43408b83/)
+- **Adrien Eppling** — Core contributor
+  [GitHub](https://github.com/aeppling) · [LinkedIn](https://www.linkedin.com/in/adrien-eppling/)
 
 ## Contributing
 
